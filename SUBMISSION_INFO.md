@@ -44,6 +44,10 @@ Use the information below to register **Auto Terminal** on MCP directories.
 ### [Glama (Pulse)](https://glama.ai)
 *   **Method**: Check their [Discord Community](https://discord.com/invite/glama) for show-and-tell channels or look for a submission form on their dashboard if available.
 
+### [Smithery.ai](https://smithery.ai)
+*   **Method**: Sign up at [smithery.ai](https://smithery.ai) and connect your GitHub repository.
+*   **Configuration**: The repository now includes `Dockerfile` and `smithery.yaml` for automatic deployment.
+
 ## 3. Configuration JSON (for Users)
 
 ```json

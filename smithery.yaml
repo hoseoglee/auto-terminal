@@ -1,0 +1,10 @@
+startCommand:
+  type: stdio
+  command: python
+  args:
+    - gui_launcher.py
+    - --mcp
+    - --sse
+  configSchema:
+    type: object
+    properties: {}
