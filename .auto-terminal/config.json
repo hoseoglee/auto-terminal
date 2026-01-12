@@ -1,0 +1,29 @@
+[
+    {
+        "name": "upbit-2",
+        "command": "python upbit_manager.py nuna",
+        "cwd": "/Volumes/Shared/SharedFolder/cursor/coinbot/Trading"
+    },
+    {
+        "name": "binance-1",
+        "command": "python binance_manager.py my",
+        "cwd": "/Volumes/Shared/SharedFolder/cursor/coinbot/Trading"
+    },
+    {
+        "name": "HSCode3",
+        "command": "npm run dev",
+        "cwd": "/Volumes/Shared/SharedFolder/cursor/HSCode3"
+    },
+    {
+        "name": "market monitor",
+        "command": "python market_monitor.py --no-voice",
+        "cwd": "/Volumes/Shared/SharedFolder/cursor/coinbot/MarketMonitor",
+        "shell": "/bin/zsh"
+    },
+    {
+        "name": "open router free server log",
+        "command": "docker logs -f openrouter-free-server",
+        "cwd": "/Volumes/Shared/SharedFolder/cursor/autorun",
+        "shell": "/bin/zsh"
+    }
+]
