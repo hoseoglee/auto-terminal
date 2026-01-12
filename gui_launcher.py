@@ -1732,7 +1732,8 @@ if __name__ == "__main__":
             mcp.run()
     else:
         app = QApplication(sys.argv)
-        app.setWindowIcon(QIcon('app_icon.png'))
+        icon_path = 'app_icon.icns' if os.path.exists('app_icon.icns') else 'app_icon.png'
+        app.setWindowIcon(QIcon(icon_path))
         window = LauncherApp()
         window.show()
         try:
