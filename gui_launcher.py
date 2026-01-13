@@ -1,5 +1,6 @@
 import os
 import sys
+import weakref
 import json
 import subprocess
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -7,10 +8,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QDialog, QLabel, QLineEdit, QFileDialog, 
                              QHeaderView, QTextEdit, QSplitter, QMdiArea, QMdiSubWindow,
                              QStyleFactory, QCheckBox, QComboBox, QMenu, QToolButton, QFrame)
-from PyQt6.QtCore import Qt, QProcess, QByteArray, QThread, pyqtSignal, QRegularExpression, QTimer, QUrl
+from PyQt6.QtCore import Qt, QProcess, QByteArray, QThread, pyqtSignal, QRegularExpression, QTimer, QUrl, QEvent
 from PyQt6.QtGui import (QIcon, QBrush, QColor, QPalette, QSyntaxHighlighter, QTextCharFormat, 
                          QFont, QAction, QKeySequence, QDesktopServices, QTextCursor, QTextDocument)
 from PyQt6.QtNetwork import QTcpServer, QTcpSocket, QHostAddress
+from PyQt6.QtCore import QSocketNotifier
+from PyQt6 import sip
 
 import time
 import datetime
@@ -18,6 +21,12 @@ import psutil
 import threading
 from collections import deque
 from fastmcp import FastMCP
+import pty
+import select
+import tty
+import termios
+import fcntl
+import struct
 
 HIDDEN_DIR = os.path.join(os.getcwd(), '.auto-terminal')
 os.makedirs(HIDDEN_DIR, exist_ok=True)
@@ -361,6 +370,7 @@ def try_gui_execution(command, name, cwd):
     return None
 
 import signal
+import codecs
 
 class ConsoleInput(QLineEdit):
     def __init__(self, parent=None):
@@ -490,6 +500,46 @@ class LogHighlighter(QSyntaxHighlighter):
                 self.setFormat(match.capturedStart(), match.capturedLength(), format)
 
 class TerminalOutput(QTextEdit):
+    output_signal = pyqtSignal(str)
+    
+    def keyPressEvent(self, event):
+        # Forward key to PTY
+        text = event.text()
+        key = event.key()
+        
+        # Handle special keys
+        if key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+            text = "\r"
+        elif key == Qt.Key.Key_Backspace:
+            text = "\x08"
+        elif key == Qt.Key.Key_Tab:
+             text = "\t"
+        elif key == Qt.Key.Key_Escape:
+             text = "\x1b"
+        elif key == Qt.Key.Key_Up:
+             text = "\x1b[A"
+        elif key == Qt.Key.Key_Down:
+             text = "\x1b[B"
+        elif key == Qt.Key.Key_Right:
+             text = "\x1b[C"
+        elif key == Qt.Key.Key_Left:
+             text = "\x1b[D"
+        elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and key == Qt.Key.Key_C:
+             text = "\x03" # Ctrl+C
+        
+        # Only emit if there is text to send. 
+        # For shift/ctrl/alt alone we don't send anything usually.
+        if text:
+             self.output_signal.emit(text)
+             
+        # Scroll to bottom on input
+        # self.moveCursor(QTextCursor.MoveOperation.End)
+        
+        # Do not call super().keyPressEvent(event) to prevent local editing
+        # But allow scrolling with PgUp/PgDown if needed?
+        if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+             super().keyPressEvent(event)
+
     def mouseReleaseEvent(self, event):
         # Handle Smart Links
         cursor = self.cursorForPosition(event.pos())
@@ -594,7 +644,15 @@ class TerminalTab(QWidget):
 
         # Terminal Output Area
         self.terminal_output = TerminalOutput()
-        self.terminal_output.setReadOnly(True)
+        self.terminal_output.setReadOnly(True) 
+        # Actually setReadOnly(True) blocks keyPressEvent in some Qt versions/widgets if interaction is disabled?
+        # But usually keyPressEvent still fires. 
+        # To be safe, let's keep it but trust our override.
+        # Actually, if readOnly is true, QTextEdit might consume keys for navigation and not emit all.
+        # Let's try ReadOnly first, if it blocks, we set ReadOnly False but block input in logic.
+        
+        self.terminal_output.output_signal.connect(self.send_direct_input)
+        
         # Font setup for Zoom
         font = QFont('Menlo', 12)
         font.setStyleHint(QFont.StyleHint.Monospace)
@@ -632,18 +690,10 @@ class TerminalTab(QWidget):
         """)
         layout.addWidget(self.terminal_output)
         
-        # Input Area
-        input_layout = QHBoxLayout()
-        self.terminal_input = ConsoleInput(self)
-        self.terminal_input.setPlaceholderText("Enter command... (Ctrl+C: Interrupt, Cmd+F: Find)")
-        self.terminal_input.returnPressed.connect(self.send_input)
-        input_layout.addWidget(self.terminal_input)
+        layout.addWidget(self.terminal_output)
         
-        self.btn_send = QPushButton("Send")
-        self.btn_send.clicked.connect(self.send_input)
-        input_layout.addWidget(self.btn_send)
-        
-        layout.addLayout(input_layout)
+        # Input Area - Removed as per user request (direct input enabled)
+        # input_layout = QHBoxLayout() ...
         
         # Control Buttons
         control_layout = QHBoxLayout()
@@ -725,26 +775,202 @@ class TerminalTab(QWidget):
         self.log_file_path = os.path.join(log_dir, f"{safe_name}_{timestamp}.log")
         self.log_file = open(self.log_file_path, 'w', encoding='utf-8')
         
-        self.process = QProcess()
-        self.process.setWorkingDirectory(cwd)
-        self.process.readyReadStandardOutput.connect(self.handle_stdout)
-        self.process.readyReadStandardError.connect(self.handle_stderr)
-        self.process.finished.connect(self.process_finished)
+        # PTY Setup
+        self.master_fd, self.slave_fd = pty.openpty()
+        
+        # Incremental Decoder for UTF-8 (handles split multibyte chars)
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors='replace')
+        
+        # Enable Overwrite Mode for correct helper behavior (e.g. zsh line editing)
+        self.terminal_output.setOverwriteMode(True)
+        
+        # Start Process
+        try:
+            if command.strip():
+                # Use login shell (-l) AND interactive (-i) to ensure env vars (pyenv) are loaded
+                # even if .zshrc has guards checking for interactivity.
+                args = [shell, '-l', '-i', '-c', command]
+            else:
+                # Interactive shell
+                args = [shell, '-l']
+
+            self.process = subprocess.Popen(
+                args,
+                cwd=cwd,
+                stdin=self.slave_fd,
+                stdout=self.slave_fd,
+                stderr=self.slave_fd,
+                preexec_fn=os.setsid, # Create new process group
+                close_fds=True
+            )
+            # Close slave fd in parent
+            os.close(self.slave_fd)
+            self.slave_fd = None
+            
+        except Exception as e:
+            self.terminal_output.append(f"Error starting process: {e}")
+            return
+
+        # Setup Socket Notifier for async reading using Qt event loop
+        self.notifier = QSocketNotifier(self.master_fd, QSocketNotifier.Type.Read)
+        self.notifier.activated.connect(self.read_from_fd)
+        
+        # Wait Thread to detect exit
+        self.wait_thread = threading.Thread(target=self.wait_for_exit, daemon=True)
+        self.wait_thread.start()
         
         # Reset buttons
         self.btn_stop.setEnabled(True)
         self.btn_restart.setEnabled(False)
-        self.status_label.setText("Starting...")
+
+        self.status_label.setText("Running")
         
-        # Run via shell
-        self.process.start(shell, ['-c', command])
+    def wait_for_exit(self):
+        # This blocks until process exits
+        try:
+            self.process.wait()
+        except: pass
+        # We rely on QSocketNotifier getting EOF to trigger UI cleanup
+    
+    def read_from_fd(self, fd):
+        if fd != self.master_fd: return
         
-        # Start Monitor Thread
-        if self.process.waitForStarted(1000):
-            pid = self.process.processId()
-            self.monitor_thread = MonitorThread(pid)
-            self.monitor_thread.stats_signal.connect(self.update_stats)
-            self.monitor_thread.start()
+        try:
+            # Read chunk
+            data = os.read(self.master_fd, 4096)
+        except OSError:
+            data = b""
+            
+        if not data:
+            # EOF
+            self.notifier.setEnabled(False)
+            self.process_finished()
+            return
+            
+        # Decode using incremental decoder
+        text = self.decoder.decode(data, final=False)
+        
+        if hasattr(self, 'log_file') and self.log_file:
+            self.log_file.write(text)
+            self.log_file.flush()
+
+        # Handle ANSI Codes and Control Characters
+        self.append_ansi_text(text)
+        
+    def append_ansi_text(self, text):
+        cursor = self.terminal_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        
+        # Tokenizer regex for ANSI sequences and Control Chars
+        # \x1B\[[?0-9;]*[a-zA-Z] -> CSI
+        # [\x08\r\n] -> Control
+        token_re = QRegularExpression(r'(\x1B\[[?0-9;]*[a-zA-Z]|\x1B\][^\x07\x1B]*\x07|[\x08\r\n])')
+        
+        current_fmt = cursor.charFormat()
+        
+        idx = 0
+        match_iter = token_re.globalMatch(text)
+        
+        while match_iter.hasNext():
+            match = match_iter.next()
+            start = match.capturedStart()
+            end = match.capturedEnd()
+            
+            # Text before the token
+            if start > idx:
+                cursor.insertText(text[idx:start], current_fmt)
+            
+            token = match.captured()
+            
+            # Handle Token
+            if token == '\x08': # Backspace (Ctrl+H)
+                cursor.deletePreviousChar()
+            elif token == '\r': # Carriage Return
+                # Move to start of the current block (line)
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            elif token == '\n': # Line Feed
+                # Insert new block
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText('\n', current_fmt)
+            elif token.startswith('\x1B['): # CSI
+                self.apply_ansi_format(token, current_fmt, cursor)
+            elif token.startswith('\x1B]'): # OSC
+                pass 
+                
+            idx = end
+            
+        # Remaining text
+        if idx < len(text):
+            cursor.insertText(text[idx:], current_fmt)
+            
+        if self.chk_autoscroll.isChecked():
+            self.terminal_output.setTextCursor(cursor)
+            self.terminal_output.ensureCursorVisible()
+
+    def apply_ansi_format(self, seq, fmt, cursor):
+        if not seq.startswith('\x1B['): return
+        
+        try:
+            cmd = seq[-1]
+            params = seq[2:-1]
+            
+            # Default param is 1 usually, or 0 depends on cmd
+            
+            if cmd == 'K': # Erase in Line
+                mode = 0
+                if params: mode = int(params)
+                if mode == 0: # Cursor to end
+                    cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                    cursor.removeSelectedText()
+                return
+
+            if cmd == 'A': # Cursor Up
+                n = int(params) if params else 1
+                cursor.movePosition(QTextCursor.MoveOperation.Up, QTextCursor.MoveMode.MoveAnchor, n)
+                return
+            if cmd == 'B': # Cursor Down
+                n = int(params) if params else 1
+                cursor.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.MoveAnchor, n)
+                return
+            if cmd == 'C': # Cursor Forward (Right)
+                n = int(params) if params else 1
+                cursor.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.MoveAnchor, n)
+                return
+            if cmd == 'D': # Cursor Back (Left)
+                n = int(params) if params else 1
+                cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.MoveAnchor, n)
+                return
+
+            if cmd == 'm': # SGR - Select Graphic Rendition
+                codes = [int(c) if c else 0 for c in params.split(';')]
+                if not codes: codes = [0]
+                
+                for code in codes:
+                    if code == 0: # Reset
+                        fmt.setForeground(QBrush(QColor("white")))
+                        fmt.setBackground(QBrush(Qt.GlobalColor.transparent))
+                        fmt.setFontWeight(QFont.Weight.Normal)
+                        fmt.setFontItalic(False)
+                        fmt.setFontUnderline(False)
+                    elif code == 1: # Bold
+                        fmt.setFontWeight(QFont.Weight.Bold)
+                    elif code == 3: # Italic
+                        fmt.setFontItalic(True)
+                    elif code == 4: # Underline
+                        fmt.setFontUnderline(True)
+                    elif 30 <= code <= 37: # Foreground Colors
+                        colors = ["black", "#FF5F56", "#27C93F", "#FFBD2E", "#4da6ff", "#FF00FF", "#00FFFF", "white"]
+                        fmt.setForeground(QColor(colors[code-30]))
+                    elif code == 39: # Default Foreground
+                        fmt.setForeground(QColor("white"))
+                    # Backgrounds (40-47) ignored
+                return
+            
+            # Ignore other codes (cursor movement etc for now)
+            # Bracketed paste [?2004h is handled by regex consumer but ignored here
+            
+        except:
+            pass
 
     def update_stats(self, stats):
         self.status_label.setText(stats)
@@ -760,33 +986,77 @@ class TerminalTab(QWidget):
             font.setPointSize(font.pointSize() - 1)
             self.terminal_output.setFont(font)
 
+    def cleanup(self):
+        """Cleanup resources properly to avoid crashes."""
+        self.status_label.setText("Stopping...")
+        
+        # Stop Monitor Thread (Removed - redundant)
+        if hasattr(self, 'monitor_thread'):
+            self.monitor_thread = None
+
+        # 2. Disable Socket Notifier
+        if hasattr(self, 'notifier') and self.notifier:
+            self.notifier.setEnabled(False)
+            self.notifier.deleteLater() # Schedule deletion
+            self.notifier = None
+
+        # 3. Stop Process
+        if hasattr(self, 'process') and self.process:
+            if self.process.poll() is None:
+                try:
+                    # Kill the process group
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                except:
+                    try:
+                        self.process.terminate()
+                    except: pass
+            # We don't wait indefinitely here to avoid UI freeze, but maybe short wait?
+            try:
+                self.process.wait(timeout=0.1)
+            except: pass
+            self.process = None
+
+        # 4. Close FDs
+        if hasattr(self, 'master_fd') and self.master_fd is not None:
+             try:
+                 os.close(self.master_fd)
+             except: pass
+             self.master_fd = None
+             
+        if hasattr(self, 'log_file') and self.log_file:
+            try:
+                self.log_file.close()
+            except: pass
+            self.log_file = None
+
     def stop_process(self):
-        if hasattr(self, 'monitor_thread') and self.monitor_thread:
-            self.monitor_thread.stop()
-        if self.process:
-            self.process.terminate()
+        self.cleanup()
+        self.status_label.setText("Stopped")
+        self.btn_stop.setEnabled(False)
+        self.btn_restart.setEnabled(True)
+
+    def closeEvent(self, event):
+        self.cleanup()
+        super().closeEvent(event) # Propagate if needed
 
     def send_sigint(self):
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
-            pid = self.process.processId()
-            if pid:
-                try:
-                    os.kill(pid, signal.SIGINT)
-                    self.terminal_output.append("^C")
-                except ProcessLookupError:
-                    pass
+        if hasattr(self, 'process') and self.process and self.process.poll() is None:
+            try:
+                # Send Ctrl+C via PTY
+                if hasattr(self, 'master_fd') and self.master_fd:
+                    os.write(self.master_fd, b'\x03')
+                self.terminal_output.append("^C")
+            except Exception:
+                pass
 
     def restart_process(self):
-        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
-            self.stop_process()
-            self.process.waitForFinished(1000)
-        
+        self.cleanup()
         self.terminal_output.append("\n--- Restarting ---")
         self.start_process()
 
     def process_finished(self):
-        if hasattr(self, 'monitor_thread') and self.monitor_thread:
-            self.monitor_thread.stop()
+        # Called when process exits naturally
+        self.cleanup()
             
         self.terminal_output.append(f"\n--- Process Finished ---")
         self.status_label.setText("Stopped")
@@ -875,53 +1145,19 @@ class TerminalTab(QWidget):
         else:
              QMessageBox.warning(self, "Info", "No history to add.")
 
-    def handle_stdout(self):
-        data = self.process.readAllStandardOutput()
-        text = bytes(data).decode('utf-8', errors='replace')
-        
-        if hasattr(self, 'log_file') and self.log_file:
-            self.log_file.write(text)
-            self.log_file.flush()
-            
-        # Use detached cursor to append without moving view
-        cursor = self.terminal_output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text)
-        
-        if self.chk_autoscroll.isChecked():
-            self.terminal_output.setTextCursor(cursor)
-            self.terminal_output.ensureCursorVisible()
+    # handle_stdout and handle_stderr are no longer needed
 
-    def handle_stderr(self):
-        data = self.process.readAllStandardError()
-        text = bytes(data).decode('utf-8', errors='replace')
-        
-        if hasattr(self, 'log_file') and self.log_file:
-            self.log_file.write(text)
-            self.log_file.flush()
-            
-        # Use detached cursor to append without moving view
-        cursor = self.terminal_output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text)
-        
-        if self.chk_autoscroll.isChecked():
-            self.terminal_output.setTextCursor(cursor)
-            self.terminal_output.ensureCursorVisible()
+    def send_direct_input(self, text):
+        if hasattr(self, 'process') and self.process and self.process.poll() is None:
+            if hasattr(self, 'master_fd') and self.master_fd:
+                try:
+                    os.write(self.master_fd, text.encode('utf-8'))
+                    if self.chk_autoscroll.isChecked():
+                        self.terminal_output.ensureCursorVisible()
+                except OSError:
+                    pass
 
-    def send_input(self):
-        text = self.terminal_input.text()
-        self.terminal_input.add_to_history(text)
-        
-        if self.process and self.process.state() == QProcess.ProcessState.Running:
-            input_bytes = (text + "\n").encode('utf-8')
-            self.process.write(QByteArray(input_bytes))
-            self.terminal_output.insertPlainText(f"{text}\n")
-            self.terminal_input.clear()
-            if self.chk_autoscroll.isChecked():
-                self.terminal_output.ensureCursorVisible()
-        else:
-            self.terminal_input.clear()
+    # send_input removed
 
     def show_notification(self, title, message):
         try:
@@ -1003,6 +1239,206 @@ class CustomTitleBar(QWidget):
 
     def mouseReleaseEvent(self, event):
         self.start_pos = None
+
+
+class ResizableMdiSubWindow(QMdiSubWindow):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setMouseTracking(True)
+        self.resize_margin = 5
+        self.resize_mode = None
+        self.start_pos = None
+        self.start_geometry = None
+        self.start_global_pos = None
+
+    def setWidget(self, widget):
+        super().setWidget(widget)
+        if widget:
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+            widget.setAttribute(Qt.WidgetAttribute.WA_Hover)
+
+    def eventFilter(self, obj, event):
+        if obj == self.widget():
+            if event.type() == QEvent.Type.HoverMove or event.type() == QEvent.Type.MouseMove:
+                if self.resize_mode:
+                    # In Qt6, event.globalPosition() returns QPointF
+                    try:
+                        gpos = event.globalPosition().toPoint()
+                    except:
+                        # Fallback for Qt5 or if globalPosition not available directly
+                        gpos = event.globalPos()
+                    self.do_resize(gpos)
+                    return True
+                # Use robust position check
+                try:
+                    pos = event.position().toPoint()
+                except:
+                    pos = event.pos()
+                self.update_cursor(pos)
+            elif event.type() == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    try:
+                        pos = event.position().toPoint()
+                        gpos = event.globalPosition().toPoint()
+                    except:
+                        pos = event.pos()
+                        gpos = event.globalPos()
+                        
+                    self.start_resize(pos, gpos)
+                    if self.resize_mode:
+                        return True
+            elif event.type() == QEvent.Type.MouseButtonRelease:
+                if self.resize_mode:
+                    self.stop_resize()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def update_cursor(self, pos):
+        if self.resize_mode: return
+        mode = self.get_resize_mode(pos)
+        if mode in ['left', 'right']:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif mode in ['top', 'bottom']:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif mode in ['top_left', 'bottom_right']:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif mode in ['top_right', 'bottom_left']:
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def get_resize_mode(self, pos):
+        w = self.width()
+        h = self.height()
+        m = self.resize_margin
+        x = pos.x()
+        y = pos.y()
+        
+        on_top = y < m
+        on_bottom = y > h - m
+        on_left = x < m
+        on_right = x > w - m
+        
+        if on_top and on_left: return "top_left"
+        if on_top and on_right: return "top_right"
+        if on_bottom and on_left: return "bottom_left"
+        if on_bottom and on_right: return "bottom_right"
+        if on_top: return "top"
+        if on_bottom: return "bottom"
+        if on_left: return "left"
+        if on_right: return "right"
+        return None
+
+    def start_resize(self, local_pos, global_pos):
+        mode = self.get_resize_mode(local_pos)
+        if mode:
+            self.resize_mode = mode
+            self.start_global_pos = global_pos
+            self.start_geometry = self.geometry()
+            
+            # --- Global Line Resizing Logic ---
+            # We identify "Edge Groups" - sets of windows sharing the line we are moving.
+            # We use weakref to prevent reference cycles and crashes on cleanup
+            self.x_affected = [] # List of (weakref_window, 'left' or 'right', start_rect)
+            self.y_affected = [] # List of (weakref_window, 'top' or 'bottom', start_rect)
+            
+            if self.mdiArea():
+                margin = 15 
+                all_windows = self.mdiArea().subWindowList()
+                my_rect = self.geometry()
+                
+                # Check Vertical Line (for Left/Right resize)
+                target_x = None
+                if 'left' in mode: target_x = my_rect.left()
+                elif 'right' in mode: target_x = my_rect.right()
+                
+                if target_x is not None:
+                    for w in all_windows:
+                        if not w.isVisible(): continue
+                        g = w.geometry()
+                        # If window's Left is on the line
+                        if abs(g.left() - target_x) < margin:
+                            self.x_affected.append((weakref.ref(w), 'left', g))
+                        # If window's Right is on the line
+                        elif abs(g.right() - target_x) < margin:
+                            self.x_affected.append((weakref.ref(w), 'right', g))
+
+                # Check Horizontal Line (for Top/Bottom resize)
+                target_y = None
+                if 'top' in mode: target_y = my_rect.top()
+                elif 'bottom' in mode: target_y = my_rect.bottom()
+                
+                if target_y is not None:
+                    for w in all_windows:
+                        if not w.isVisible(): continue
+                        g = w.geometry()
+                        # If Top is on line
+                        if abs(g.top() - target_y) < margin:
+                            self.y_affected.append((weakref.ref(w), 'top', g))
+                        # If Bottom is on line
+                        elif abs(g.bottom() - target_y) < margin:
+                            self.y_affected.append((weakref.ref(w), 'bottom', g))
+
+    def do_resize(self, global_pos):
+        if not self.start_geometry: return
+        delta = global_pos - self.start_global_pos
+        dx = delta.x()
+        dy = delta.y()
+        
+        # We will calculate new requests for each window
+        new_geoms = {}
+        
+        # initialize with current/start geoms
+        def get_geom_entry(win, rect):
+            if win not in new_geoms:
+                new_geoms[win] = [rect.x(), rect.y(), rect.width(), rect.height()]
+            return new_geoms[win]
+
+        # Apply X changes
+        for ref_win, edge_type, r in self.x_affected:
+            win = ref_win()
+            if win is None: continue
+            
+            entry = get_geom_entry(win, r)
+            if edge_type == 'left':
+                entry[0] = r.x() + dx
+                entry[2] = r.width() - dx
+            elif edge_type == 'right':
+                entry[2] = r.width() + dx
+
+        # Apply Y changes
+        for ref_win, edge_type, r in self.y_affected:
+            win = ref_win()
+            if win is None: continue
+            
+            entry = get_geom_entry(win, r)
+            if edge_type == 'top':
+                 entry[1] = r.y() + dy
+                 entry[3] = r.height() - dy
+            elif edge_type == 'bottom':
+                 entry[3] = r.height() + dy
+
+        # Apply Min Size Constraints & Commit
+        for win, vals in new_geoms.items():
+            nx, ny, nw, nh = vals
+            
+            if nw < 200: nw = 200
+            if nh < 100: nh = 100
+            
+            # Additional Safety check for closing windows
+            try:
+                if hasattr(win, 'isVisible') and not sip.isdeleted(win) and win.isVisible():
+                    win.setGeometry(nx, ny, nw, nh)
+            except:
+                pass
+
+    def stop_resize(self):
+        self.resize_mode = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.x_affected = []
+        self.y_affected = []
 
 
 class LauncherApp(QMainWindow):
@@ -1153,6 +1589,21 @@ class LauncherApp(QMainWindow):
         launch_layout.addWidget(self.btn_launch_all)
         
         left_layout.addLayout(launch_layout)
+
+        # New Terminal Button
+        self.btn_new_term = QPushButton("New Terminal")
+        self.btn_new_term.clicked.connect(self.new_terminal)
+        self.btn_new_term.setStyleSheet("""
+            QPushButton {
+                background-color: #27C93F;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+            }
+            QPushButton:hover { background-color: #2ecc71; }
+            QPushButton:pressed { background-color: #27ae60; }
+        """)
+        left_layout.addWidget(self.btn_new_term)
         
         splitter.addWidget(left_panel)
         
@@ -1332,14 +1783,49 @@ class LauncherApp(QMainWindow):
             print(f"Failed to start MCP Server: {e}")
 
     def closeEvent(self, event):
-        # Clean up MCP server
-        if self.mcp_process:
+        """Cleanup all processes and threads before exiting to prevent crashes."""
+        print("Closing application, cleaning up resources...")
+        
+        # Stop MCP Server
+        if hasattr(self, 'mcp_server_process') and self.mcp_server_process:
             print("Stopping MCP Server...")
-            self.mcp_process.terminate()
             try:
-                self.mcp_process.wait(timeout=2)
+                self.mcp_server_process.terminate()
+                self.mcp_server_process.wait(timeout=0.5)
             except:
-                self.mcp_process.kill()
+                pass
+            self.mcp_server_process = None
+
+        # Stop IPC Server (shutdown can block, so be careful)
+        if hasattr(self, 'ipc_server') and self.ipc_server:
+            try:
+                # We just close the socket here, forcing threads to exit?
+                # shutdown() waits for threads, which might hang if they are blocked on I/O.
+                # server_close() is safer if we don't care about pending requests.
+                self.ipc_server.server_close()
+                self.ipc_server.shutdown() 
+            except: pass
+            self.ipc_server = None
+
+        # Cleanup all terminal tabs
+        if hasattr(self, 'mdi') and self.mdi:
+            for subwindow in self.mdi.subWindowList():
+                try:
+                    # Access the container widget
+                    container = subwindow.widget()
+                    if container:
+                        # Iterate through layout items to find TerminalTab
+                        layout = container.layout()
+                        if layout:
+                            for i in range(layout.count()):
+                                widget = layout.itemAt(i).widget()
+                                if isinstance(widget, TerminalTab):
+                                    widget.cleanup()
+                                    break
+                except Exception as e:
+                    print(f"Error cleaning up tab: {e}")
+                subwindow.close()
+        
         super().closeEvent(event)
 
     def load_config(self):
@@ -1391,8 +1877,10 @@ class LauncherApp(QMainWindow):
 
     def launch_program(self, prog):
         # Create new subwindow with Frameless hint for custom title bar
-        sub = QMdiSubWindow()
-        sub.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        # sub = QMdiSubWindow()
+        # Use our custom Resizable class
+        sub = ResizableMdiSubWindow()
+        # sub.setWindowFlags(Qt.WindowType.FramelessWindowHint) # Already set in __init__
         
         # Container Widget
         container = QWidget()
@@ -1485,6 +1973,16 @@ class LauncherApp(QMainWindow):
 
     def close_all_windows(self):
         self.mdi.closeAllSubWindows()
+
+    def new_terminal(self):
+        # Default shell config
+        prog = {
+            'name': 'Terminal',
+            'command': '', # Empty command means just run shell
+            'cwd': os.getcwd(),
+            'shell': '/bin/zsh'
+        }
+        self.launch_program(prog)
 
 
 class EditDialog(QDialog):
@@ -1725,18 +2223,46 @@ def remove_program_config(name: str) -> str:
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     
+    # Ensure signal module is imported (it is standard, but good practice to be explicit if used)
+    import signal 
+
     if "--mcp" in sys.argv:
         if "--sse" in sys.argv:
             mcp.run(transport="sse")
         else:
             mcp.run()
     else:
-        app = QApplication(sys.argv)
-        icon_path = 'app_icon.icns' if os.path.exists('app_icon.icns') else 'app_icon.png'
-        app.setWindowIcon(QIcon(icon_path))
-        window = LauncherApp()
-        window.show()
+        # Handle Ctrl+C gracefully
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+
         try:
+            app = QApplication(sys.argv)
+            
+            # Setup signal handling to quit Qt app
+            # Revert to default handler is one way, but connecting to quit is safer for cleanup
+            def sigint_handler(signum, frame):
+                print("Received SIGINT, quitting application...")
+                QApplication.quit()
+                
+            signal.signal(signal.SIGINT, sigint_handler)
+
+            icon_path = 'app_icon.icns' if os.path.exists('app_icon.icns') else 'app_icon.png'
+            app.setWindowIcon(QIcon(icon_path))
+            
+            window = LauncherApp()
+            window.show()
+            
+            # Use QTimer to allow python interpreter to process signals periodically
+            # This is a common Qt+Python trick to let Ctrl+C work
+            timer = QTimer()
+            timer.start(500) 
+            timer.timeout.connect(lambda: None) 
+            
             sys.exit(app.exec())
+            
         except KeyboardInterrupt:
+            print("\nKeyboardInterrupt caught in main.")
             sys.exit(0)
+        except Exception as e:
+            print(f"\nCrash during startup: {e}")
+            sys.exit(1)
