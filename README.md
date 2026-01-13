@@ -1,8 +1,11 @@
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/hs03)
+[![smithery badge](https://smithery.ai/badge/hs03/auto-terminal)](https://smithery.ai/server/hs03/auto-terminal)
+
 # Auto Terminal
 
 <img src="app_icon.png" width="128" />
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/hs03)
+
 
 **Auto Terminal** is a powerful process manager and terminal automation tool that doubles as a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server. It allows AI agents (like Cursor, Claude Desktop) to execute terminal commands, manage background processes, and monitor output in real-time.
 
