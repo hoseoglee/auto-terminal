@@ -28,7 +28,8 @@ import termios
 import fcntl
 import struct
 
-HIDDEN_DIR = os.path.join(os.getcwd(), '.auto-terminal')
+
+HIDDEN_DIR = os.path.join(os.path.expanduser('~'), '.auto-terminal')
 os.makedirs(HIDDEN_DIR, exist_ok=True)
 
 CONFIG_FILE = os.path.join(HIDDEN_DIR, 'config.json')
@@ -36,6 +37,20 @@ SNIPPETS_FILE = os.path.join(HIDDEN_DIR, 'snippets.json')
 
 # Initialize the MCP Server (will be used if --mcp is passed)
 mcp = FastMCP("Auto Terminal")
+
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+
+
 
 class ProcessManager:
     def __init__(self):
@@ -1445,7 +1460,7 @@ class LauncherApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Auto Terminal")
-        self.setWindowIcon(QIcon('app_icon.png'))
+        self.setWindowIcon(QIcon(resource_path('app_icon.png')))
         self.resize(1100, 700)
         
         # Start MCP Server
@@ -2246,7 +2261,7 @@ if __name__ == "__main__":
                 
             signal.signal(signal.SIGINT, sigint_handler)
 
-            icon_path = 'app_icon.icns' if os.path.exists('app_icon.icns') else 'app_icon.png'
+            icon_path = resource_path('app_icon.icns') if os.path.exists(resource_path('app_icon.icns')) else resource_path('app_icon.png')
             app.setWindowIcon(QIcon(icon_path))
             
             window = LauncherApp()

@@ -31,6 +31,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Running the Application
+
+### 1. Easy Launcher (macOS)
+Double-click the **`Run Auto Terminal.command`** file in the project folder. 
+This will launch the application using your local Python environment.
+
+### 2. Manual Start
+```bash
+# Activate venv
+source .venv/bin/activate
+
+# Run
+python gui_launcher.py
+```
+
 ## Usage
 
 ### 1. GUI Mode
